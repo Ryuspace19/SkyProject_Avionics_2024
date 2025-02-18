@@ -1,0 +1,294 @@
+import tkinter as tk
+import serial
+import threading
+import time
+import os
+from serial.tools import list_ports
+from concurrent.futures import ThreadPoolExecutor
+
+# グローバル変数
+ser = None
+logging_active = True  # SDカードへのログが有効かどうかを管理
+executor = ThreadPoolExecutor(max_workers=3)  # 最大3つのスレッドを使用
+buffer = []  # データをバッファリングするリスト
+buffer_size = 20  # 2秒分のデータ（20個）をバッファリング
+filename = "data_log.txt"  # デフォルトのファイル名
+
+# Tkinterの設定
+root = tk.Tk()
+root.geometry("1300x800")
+
+# スタート画面の作成
+def show_start_screen():
+    # スタート画面のウィジェットを作成
+    start_label = tk.Label(root, text="HPA_PilotApplication", font=('Helvetica', 40))
+    start_label.pack(pady=150)
+
+    input_frame = tk.Frame(root)
+    input_frame.pack(pady=20)
+
+    save_name_label = tk.Label(input_frame, text="保存名:", font=('Helvetica', 20))
+    save_name_label.pack(side=tk.LEFT)
+
+    save_name_entry = tk.Entry(input_frame, font=('Helvetica', 20), width=30)
+    save_name_entry.pack(side=tk.LEFT)
+
+    def start_application():
+        global filename
+        filename = save_name_entry.get() + ".txt" if save_name_entry.get() else "data_log.txt"
+        start_label.pack_forget()
+        input_frame.pack_forget()
+        start_button.pack_forget()
+        credit_label.pack_forget()
+        show_main_screen()
+
+    start_button = tk.Button(root, text="Start", font=('Helvetica', 30), command=start_application)
+    start_button.pack(pady=50)
+
+    credit_label = tk.Label(root, text="@SkyProject_2022~2024", font=('Helvetica', 15))
+    credit_label.pack(side=tk.BOTTOM, pady=20)
+
+# メイン画面（数値表示画面）を表示
+def show_main_screen():
+    # 画面を4分割するための線を引く関数
+    def draw_lines(canvas):
+        width = 1300
+        height = 800
+        # 垂直線
+        canvas.create_line(width / 2, 0, width / 2, height, fill="black")
+        # 水平線
+        canvas.create_line(0, height / 2, width, height / 2, fill="black")
+
+    # キャンバスを作成して線を描画
+    canvas = tk.Canvas(root, width=1300, height=800)
+    canvas.pack()
+    draw_lines(canvas)
+
+    # ラベル部分（文字部分）を作成して配置
+    label_speed_text = tk.Label(root, text="速度:", font=('Helvetica', 40))
+    label_speed_text.place(x=50, y=150)
+
+    label_rpm_text = tk.Label(root, text="回転数:", font=('Helvetica', 40))
+    label_rpm_text.place(x=670, y=150)
+
+    label_altitude_text = tk.Label(root, text="高度:", font=('Helvetica', 40))
+    label_altitude_text.place(x=50, y=500)
+
+    # 数値部分のラベルを作成して配置
+    label_speed_value = tk.Label(root, text="0.0", font=('Helvetica', 90))
+    label_speed_value.place(x=200, y=150)
+
+    label_rpm_value = tk.Label(root, text="0", font=('Helvetica', 90))
+    label_rpm_value.place(x=870, y=150)
+
+    label_altitude_value = tk.Label(root, text="0", font=('Helvetica', 90))
+    label_altitude_value.place(x=200, y=500)
+
+    # 単位のラベルを作成して配置
+    label_speed_unit = tk.Label(root, text="m/s", font=('Helvetica', 40))
+    label_speed_unit.place(x=650, y=275)
+
+    label_rpm_unit = tk.Label(root, text="rpm", font=('Helvetica', 40))
+    label_rpm_unit.place(x=1270, y=275)
+
+    label_altitude_unit = tk.Label(root, text="cm", font=('Helvetica', 40))
+    label_altitude_unit.place(x=650, y=625)
+
+    # バーの設定
+    bar_height = 280  # バーの高さ
+    bar_width = 50  # バーの幅
+    bar_canvas = tk.Canvas(root, width=bar_width, height=bar_height, bg='white', highlightthickness=1, highlightbackground='black')
+    bar_canvas.place(x=5, y=400)  # ALTの左側にバーを配置
+
+    # 右下にSDカードの状況を表示するラベル
+    label_sd_status = tk.Label(root, text="SD: NO", font=('Helvetica', 30))
+    label_sd_status.place(x=680, y=420)
+
+    # 右下に接続ボタンと状態ラベルを追加
+    label_connection_status = tk.Label(root, text="No Connection", font=('Helvetica', 20))
+    label_connection_status.place(x=800, y=540)
+
+    # COMポート選択用のドロップダウンメニューとラベル
+    com_label = tk.Label(root, text="COMポート:", font=('Helvetica', 20))
+    com_label.place(x=680, y=480)
+
+    # 利用可能なCOMポートのリストを取得
+    available_ports = [port.device for port in list_ports.comports()]
+
+    # COMポート選択メニューの変数
+    selected_com_port = tk.StringVar()
+    selected_com_port.set(available_ports[0] if available_ports else "")
+
+    com_menu = tk.OptionMenu(root, selected_com_port, *available_ports)
+    com_menu.config(font=('Helvetica', 20))
+    com_menu.place(x=840, y=475)
+
+    def connect_com():
+        global ser
+        com_port = selected_com_port.get()  # ドロップダウンから選択されたCOMポートを取得
+        try:
+            ser = serial.Serial(com_port, 115200)
+            label_connection_status.config(text="Connected")
+            start_data_update_thread()  # 並列処理を開始
+        except serial.SerialException as e:
+            label_connection_status.config(text="No Connection")
+            print(f"Failed to open serial port: {e}")
+
+    connect_button = tk.Button(root, text="接続", font=('Helvetica', 20), command=connect_com)
+    connect_button.place(x=680, y=530)
+
+    # SDカードの状態をチェックする関数
+    def check_sd_card():
+        if os.path.exists('D:/'):
+            label_sd_status.config(text="SD: OK")
+        else:
+            label_sd_status.config(text="SD: NO")
+
+    # 受信データをSDカードに保存する関数
+    def save_data_to_sd(data):
+        global logging_active, buffer
+        if logging_active:
+            # 改行を追加してデータをバッファに追加
+            buffer.append(data + '\n')
+            if len(buffer) >= buffer_size:
+                try:
+                    with open(f'D:/{filename}', 'a') as file:
+                        file.writelines(buffer)
+                    buffer.clear()  # バッファをクリア
+                except Exception as e:
+                    print(f"Error saving data to SD card: {e}")
+
+    # 高度バーの更新関数
+    def update_alt_bar(alt_value):
+        # 高度の値をバーの高さに反映（0~100の範囲）
+        alt_percentage = max(0.0, min(float(alt_value) / 100.0, 1.0))  # 0~1.0の範囲に収める
+        fill_height = bar_height * alt_percentage
+        bar_canvas.delete("all")
+
+        # バーの色を決定（100未満：緑、100以上：赤）
+        if float(alt_value) >= 100.0:
+            color = "red"
+        else:
+            color = "green"
+
+        # 黒枠を再描画
+        bar_canvas.create_rectangle(0, 0, bar_width, bar_height, outline='black')
+        # バーを描画
+        bar_canvas.create_rectangle(0, bar_height - fill_height, bar_width, bar_height, fill=color)
+
+    # データの更新関数
+    def update_data():
+        while ser is not None and ser.is_open:
+            try:
+                start_time = time.time()  # タイミング計測開始
+                line = ser.readline().decode('utf-8').strip()
+                check_sd_card()  # SDカードの状態を更新
+                save_data_to_sd(line)  # データをバッファに保存
+                data = line.split(',')
+
+                speed_value = None
+                rpm_value = None
+                altitude_value = None
+
+                # データの解析
+                for i in range(len(data)):
+                    if data[i] == "AIR":  # 速度
+                        speed_value = data[i + 1]
+                    elif data[i] == "RS":  # 回転数
+                        rpm_value = data[i + 1]
+                    elif data[i] == "ALT":  # 高度
+                        altitude_value = data[i + 1]
+
+                # 数値のラベルを更新
+                if speed_value is not None:
+                    label_speed_value.config(text=speed_value)
+                if rpm_value is not None:
+                    label_rpm_value.config(text=rpm_value)
+                if altitude_value is not None:
+                    label_altitude_value.config(text=altitude_value)
+                    update_alt_bar(altitude_value)  # 高度バーの更新
+
+                end_time = time.time()  # タイミング計測終了
+                print(f"データ処理とバッファリングにかかった時間: {end_time - start_time:.6f}秒")
+
+                time.sleep(0.025)  # 40Hzで更新
+
+            except Exception as e:
+                print(f"Error: {e}")
+
+    def start_data_update_thread():
+        executor.submit(update_data)  # 並列にデータ更新を開始
+
+    # エンターキーが押された回数を追跡
+    enter_press_count = 0
+
+    # エンターキーを押したときに呼ばれる関数
+    def on_enter(event):
+        global enter_press_count
+        global ser
+        global logging_active
+        enter_press_count += 1
+
+        if enter_press_count == 1:
+            # 1回目のエンターキー押下：画面を赤に切り替え
+            hide_all_widgets()
+            canvas.create_rectangle(0, 0, 1300, 800, fill='red')
+
+        elif enter_press_count == 2:
+            # 2回目のエンターキー押下：SDカードへのログを停止し、プログラムを待機状態にする
+            logging_active = False
+            if ser is not None and ser.is_open:
+                ser.close()
+            ser = None
+            reset_background()  # 初期状態に戻す
+
+    # 全てのウィジェットを隠す関数
+    def hide_all_widgets():
+        label_speed_text.place_forget()
+        label_rpm_text.place_forget()
+        label_altitude_text.place_forget()
+        label_speed_value.place_forget()
+        label_rpm_value.place_forget()
+        label_altitude_value.place_forget()
+        label_speed_unit.place_forget()
+        label_rpm_unit.place_forget()
+        label_altitude_unit.place_forget()
+        label_sd_status.place_forget()
+        label_connection_status.place_forget()
+        com_label.place_forget()
+        com_menu.place_forget()
+        connect_button.place_forget()
+        canvas.delete("all")
+        bar_canvas.place_forget()
+
+    # 背景を元に戻す関数
+    def reset_background():
+        global enter_press_count
+        canvas.delete("all")
+        draw_lines(canvas)
+        label_speed_text.place(x=50, y=150)
+        label_rpm_text.place(x=670, y=150)
+        label_altitude_text.place(x=50, y=500)
+        label_speed_value.place(x=200, y=150)
+        label_rpm_value.place(x=870, y=150)
+        label_altitude_value.place(x=200, y=500)
+        label_speed_unit.place(x=650, y=275)
+        label_rpm_unit.place(x=1270, y=275)
+        label_altitude_unit.place(x=650, y=625)
+        label_sd_status.place(x=680, y=420)
+        label_connection_status.place(x=800, y=540)
+        com_label.place(x=680, y=480)
+        com_menu.place(x=840, y=475)
+        connect_button.place(x=680, y=530)
+        bar_canvas.place(x=5, y=400)
+        root.configure(bg='SystemButtonFace')
+        enter_press_count = 0  # エンターキー押下回数をリセット
+
+    # エンターキーのイベントをバインド
+    root.bind('<Return>', on_enter)
+
+# 初期表示はスタート画面
+show_start_screen()
+
+# Tkinterのメインループを開始
+root.mainloop()
